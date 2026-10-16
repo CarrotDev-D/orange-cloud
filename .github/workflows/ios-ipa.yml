@@ -1,0 +1,618 @@
+name: Build iOS IPA (OpenSource Unlocked)
+
+# 作用:一键编译 Orange Cloud iOS 端并打出 IPA,无需任何手动改工程文件的步骤。
+# 工作流会自动完成:
+#   1. 每天 08:00(北京时间)检查上游 chen2he/orange-cloud 是否有新代码:
+#      有更新则强制同步(有冲突也直接覆盖,但会保留本仓库的
+#      .github/workflows/ 工作流文件),同步完成后接着自动编译并发布 Release;
+#      无更新则同步/编译/发版全部跳过,不打扰。
+#   2. 通用 body 自动拆分:构建前运行内嵌 Python 脚本,扫描所有 Swift 文件的
+#      `var body: some View`,若顶层修饰符链过长(默认 20+ 个)则自动拆分为
+#      private helper 属性,规避 Swift 编译器
+#      "unable to type-check this expression in reasonable time" 超时。
+#      脚本只处理"基础表达式 + 顶层线性修饰符链"的简单模式,遇到顶层
+#      let/if/switch 等复杂结构会自动跳过;输出前做括号平衡校验。
+#      相比静态补丁,脚本每次重新分析当前源码,上游改动不会导致失效。
+#   3. 通过命令行参数注入 SWIFT_ACTIVE_COMPILATION_CONDITIONS =
+#      OPENSOURCE_UNLOCKED(解锁全部功能,跳过 StoreKit 内购校验,逻辑见
+#      apps/ios/Orange Cloud/Orange Cloud/Core/Purchase/EntitlementStore.swift)。
+#      注:Xcode 26.5+ 自带 Swift 6.3,求解器已重写,旧版的
+#      -solver-memory-threshold 内部参数已被苹果删除,故不再传入。
+#   4. 关闭签名编译 + 打包 IPA + 上传产物 + 发布到 Releases 供下载
+#
+# 注意:CI 环境没有作者的 Apple Developer 证书,产物为未签名 IPA,
+# 下载后需自行签名再安装(例如 Sideloadly / AltStore / TrollStore 重签)。
+#
+# 注意2:上游源码中个别超长 SwiftUI body 偶发 Swift 编译器
+# "unable to type-check this expression in reasonable time" 报错(与 CI 环境、
+# Xcode 版本及机器负载相关,非必现),已用通用自动拆分脚本在构建前处理。
+# 全程使用 Release 配置编译。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "ios-v*"
+  schedule:
+    - cron: "0 16 * * *"
+
+# 同步任务需要强制推送,发布 Release 需要写权限
+permissions:
+  contents: write
+  actions: write
+
+env:
+  PROJECT_PATH: apps/ios/Orange Cloud/Orange Cloud.xcodeproj
+  SCHEME: Orange Cloud
+
+jobs:
+  # 每日 08:00(北京时间)定时触发时,先强制同步上游官方仓库最新代码。
+  # 有冲突也直接覆盖,但会保留本仓库的 .github/workflows/ 工作流文件
+  # (补丁已内嵌在 yml 里,无需保留其他文件)。
+  sync-upstream:
+    name: 强制同步上游仓库(保留工作流)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    outputs:
+      synced: ${{ steps.sync.outputs.synced }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 强制同步 chen2he/orange-cloud
+        id: sync
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BRANCH="${{ github.ref_name }}"
+          echo "目标分支: $BRANCH"
+          git remote add upstream https://github.com/chen2he/orange-cloud.git 2>/dev/null || true
+          git fetch upstream --prune
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          echo "上游 main: $UPSTREAM_SHA"
+          # 上游已是本地祖先(含"本地==上游"和"本地==上游+工作流提交"两种情况)
+          # 说明上游没有新代码,无需同步,也不必编译发版
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "本地已包含上游最新代码,跳过同步/编译/发版"
+            echo "synced=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 备份需要保留的文件(上游没有这些文件,reset --hard 会删掉它们)
+          BACKUP_DIR=$(mktemp -d)
+          KEEP_LIST=".github/workflows"
+          for p in $KEEP_LIST; do
+            if [ -e "$p" ]; then
+              mkdir -p "$BACKUP_DIR/$(dirname "$p")"
+              cp -r "$p" "$BACKUP_DIR/$p"
+            fi
+          done
+          echo "已备份保留文件: $KEEP_LIST"
+          # 强制同步:丢弃本地所有修改,有冲突也直接用上游覆盖
+          git reset --hard upstream/main
+          # 恢复保留的文件
+          for p in $KEEP_LIST; do
+            if [ -e "$BACKUP_DIR/$p" ]; then
+              mkdir -p "$(dirname "$p")"
+              cp -r "$BACKUP_DIR/$p" "$p"
+            fi
+          done
+          rm -rf "$BACKUP_DIR"
+          git add -A
+          git commit -m "chore: 每日强制同步上游 chen2he/orange-cloud@${UPSTREAM_SHA:0:7}" || echo "无新提交"
+          git push --force origin "HEAD:$BRANCH"
+          echo "同步完成,已强制推送到 $BRANCH"
+          echo "synced=true" >> "$GITHUB_OUTPUT"
+
+  build-ipa:
+    needs: sync-upstream
+    # 定时任务:只有真正同步到新代码才编译;手动/标签触发:同步任务被跳过,直接编译
+    if: always() && (needs.sync-upstream.result == 'skipped' || needs.sync-upstream.outputs.synced == 'true')
+    # 与 Ruawd/orange-cloud 对齐:用 macos-latest + 默认 Xcode,不再手动选版
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 定时任务会先强制同步并推送,此处取分支最新代码,而不是触发时的旧 SHA
+          ref: ${{ github.ref_name }}
+
+      - name: 自动拆分超长 body(通用脚本,规避类型检查超时)
+        run: |
+          cat > "$RUNNER_TEMP/auto_split.py" << 'PYEOF'
+          #!/usr/bin/env python3
+          """通用 SwiftUI body 自动拆分脚本.
+
+          扫描 Swift 文件中的 `var body: some View`,若其顶层修饰符链过长,
+          自动拆分为 private helper 属性,规避 Swift 编译器
+          "unable to type-check this expression in reasonable time" 超时.
+
+          设计原则(保守优先):
+          - 只处理"基础表达式 + 顶层线性修饰符链"的简单模式;
+            body 顶层若出现 let/var/if/switch/for/guard/return 或 # 指令,直接跳过.
+          - 只在两个链节之间(深度为 0 处)拆分,不碰闭包/字符串/注释内部.
+          - 输出前做括号平衡校验,不通过则不写文件.
+          - 幂等:已含 autoSplitBody 的 body 不再处理.
+          """
+
+          import os
+          import re
+          import sys
+
+          MIN_BODY_LINES = 60      # body 行数超过此值才考虑
+          MIN_LINKS = 20           # 顶层修饰符链节超过此值才拆分
+          CHUNK_SIZE = 12          # 每段保留的链节数
+          HELPER_PREFIX = "autoSplitBody"
+          CONTROL_KW = {
+              "let", "var", "if", "switch", "for", "while",
+              "guard", "return", "do", "catch", "throw", "break",
+              "continue", "defer",
+          }
+
+
+          def skip_line_comment(t, i):
+              n = len(t)
+              while i < n and t[i] != "\n":
+                  i += 1
+              return i
+
+
+          def skip_block_comment(t, i):
+              n = len(t)
+              i += 2
+              depth = 1
+              while i < n and depth > 0:
+                  if t.startswith("/*", i):
+                      depth += 1
+                      i += 2
+                  elif t.startswith("*/", i):
+                      depth -= 1
+                      i += 2
+                  else:
+                      i += 1
+              return i
+
+
+          def skip_interpolation(t, i):
+              """从 \\( 之后开始,跳到配对的 ) 之后.返回索引或 None."""
+              n = len(t)
+              depth = 1
+              while i < n and depth > 0:
+                  c = t[i]
+                  if c == "(":
+                      depth += 1
+                      i += 1
+                  elif c == ")":
+                      depth -= 1
+                      i += 1
+                  elif c == '"':
+                      i = skip_string(t, i)
+                      if i is None:
+                          return None
+                  elif c == "/" and i + 1 < n and t[i + 1] == "/":
+                      i = skip_line_comment(t, i)
+                  elif c == "/" and i + 1 < n and t[i + 1] == "*":
+                      i = skip_block_comment(t, i)
+                  else:
+                      i += 1
+              return i if depth == 0 else None
+
+
+          def skip_string(t, i):
+              """t[i] 为引号.返回字符串结束后索引,失败返回 None."""
+              n = len(t)
+              if t.startswith('"""', i):
+                  i += 3
+                  while i < n:
+                      if t.startswith('"""', i):
+                          return i + 3
+                      if t[i] == "\\":
+                          i += 2
+                      else:
+                          i += 1
+                  return None
+              hashes = 0
+              j = i
+              while j < n and t[j] == "#":
+                  hashes += 1
+                  j += 1
+              if hashes and j < n and t[j] == '"':
+                  closing = '"' + "#" * hashes
+                  i = j + 1
+                  while i < n:
+                      if t.startswith(closing, i):
+                          return i + len(closing)
+                      if t[i] == "\\":
+                          i += 2
+                      else:
+                          i += 1
+                  return None
+              i += 1
+              while i < n:
+                  c = t[i]
+                  if c == "\\":
+                      if i + 1 < n and t[i + 1] == "(":
+                          i = skip_interpolation(t, i + 2)
+                          if i is None:
+                              return None
+                      else:
+                          i += 2
+                  elif c == '"':
+                      return i + 1
+                  elif c == "\n":
+                      return None
+                  else:
+                      i += 1
+              return None
+
+
+          def skip_balanced(t, i, oc, cc):
+              """t[i] == oc.返回配对 cc 之后的索引,失败返回 None."""
+              n = len(t)
+              depth = 0
+              while i < n:
+                  c = t[i]
+                  if c == '"':
+                      i = skip_string(t, i)
+                      if i is None:
+                          return None
+                      continue
+                  if c == "/" and i + 1 < n and t[i + 1] == "/":
+                      i = skip_line_comment(t, i)
+                      continue
+                  if c == "/" and i + 1 < n and t[i + 1] == "*":
+                      i = skip_block_comment(t, i)
+                      continue
+                  if c == oc:
+                      depth += 1
+                  elif c == cc:
+                      depth -= 1
+                      if depth == 0:
+                          return i + 1
+                  i += 1
+              return None
+
+
+          def skip_ws_comments(t, i, n):
+              while i < n:
+                  c = t[i]
+                  if c in " \t\n\r":
+                      i += 1
+                  elif c == "/" and i + 1 < n and t[i + 1] == "/":
+                      i = skip_line_comment(t, i)
+                  elif c == "/" and i + 1 < n and t[i + 1] == "*":
+                      i = skip_block_comment(t, i)
+                  else:
+                      break
+              return i
+
+
+          def has_top_level_control_flow(t, start, end):
+              depth = 0
+              i = start
+              while i < end:
+                  c = t[i]
+                  if c == '"':
+                      ni = skip_string(t, i)
+                      if ni is None:
+                          return True
+                      i = ni
+                      continue
+                  if c == "/" and i + 1 < end and t[i + 1] == "/":
+                      i = skip_line_comment(t, i)
+                      continue
+                  if c == "/" and i + 1 < end and t[i + 1] == "*":
+                      i = skip_block_comment(t, i)
+                      continue
+                  if c in "({[":
+                      depth += 1
+                  elif c in ")}]":
+                      depth -= 1
+                  elif depth == 0 and (c.isalpha() or c == "_" or c == "#"):
+                      m = re.match(r"#[a-zA-Z_][a-zA-Z0-9_]*|[a-zA-Z_][a-zA-Z0-9_]*", t[i:])
+                      if m:
+                          w = m.group(0)
+                          if w in CONTROL_KW or w.startswith("#"):
+                              return True
+                          i += len(w)
+                          continue
+                  i += 1
+              return False
+
+
+          def parse_link(t, i, n):
+              """t[i] == '.'.解析 .ident(...) + 尾随闭包.返回结束索引(不含)或 None."""
+              i += 1
+              m = re.match(r"[a-zA-Z_][a-zA-Z0-9_]*", t[i:])
+              if not m:
+                  return None
+              i += m.end()
+              i = skip_ws_comments(t, i, n)
+              if i < n and t[i] == "(":
+                  i = skip_balanced(t, i, "(", ")")
+                  if i is None:
+                      return None
+              while True:
+                  i = skip_ws_comments(t, i, n)
+                  m = re.match(r"[a-zA-Z_][a-zA-Z0-9_]*\s*:", t[i:])
+                  j = i
+                  if m:
+                      j += m.end()
+                      j = skip_ws_comments(t, j, n)
+                  if j < n and t[j] == "{":
+                      i = skip_balanced(t, j, "{", "}")
+                      if i is None:
+                          return None
+                  else:
+                      break
+              return i
+
+
+          def find_chain_links(t, start, end):
+              """找顶层修饰符链.返回 [(dot, end)] 或 None(非简单链)."""
+              links = []
+              depth = 0
+              i = start
+              while i < end:
+                  c = t[i]
+                  if c == '"':
+                      ni = skip_string(t, i)
+                      if ni is None:
+                          return None
+                      i = ni
+                      continue
+                  if c == "/" and i + 1 < end and t[i + 1] == "/":
+                      i = skip_line_comment(t, i)
+                      continue
+                  if c == "/" and i + 1 < end and t[i + 1] == "*":
+                      i = skip_block_comment(t, i)
+                      continue
+                  if c in "({[":
+                      depth += 1
+                  elif c in ")}]":
+                      depth -= 1
+                  elif c == "." and depth == 0:
+                      j = i - 1
+                      while j >= start and t[j] in " \t\n\r":
+                          j -= 1
+                      prev = t[j] if j >= start else ""
+                      if prev in ")}":
+                          le = parse_link(t, i, end)
+                          if le is None:
+                              return None
+                          links.append((i, le))
+                          i = le
+                          continue
+                  i += 1
+              if not links:
+                  return []
+              tail = skip_ws_comments(t, links[-1][1], end)
+              if tail != end:
+                  return None
+              return links
+
+
+          def balanced(t):
+              depth = 0
+              i, n = 0, len(t)
+              while i < n:
+                  c = t[i]
+                  if c == '"':
+                      ni = skip_string(t, i)
+                      if ni is None:
+                          return False
+                      i = ni
+                      continue
+                  if c == "/" and i + 1 < n and t[i + 1] == "/":
+                      i = skip_line_comment(t, i)
+                      continue
+                  if c == "/" and i + 1 < n and t[i + 1] == "*":
+                      i = skip_block_comment(t, i)
+                      continue
+                  if c in "({[":
+                      depth += 1
+                  elif c in ")}]":
+                      depth -= 1
+                      if depth < 0:
+                          return False
+                  i += 1
+              return depth == 0
+
+
+          def pick_helper_base(t):
+              k = 0
+              while (HELPER_PREFIX + str(k)) in t:
+                  k += 1
+              return HELPER_PREFIX, k
+
+
+          def split_body(t, open_idx, close_idx, links):
+              base = t[open_idx + 1:links[0][0]]
+              link_texts = [t[s:e] for s, e in links]
+              chunks = []
+              for i in range(0, len(link_texts), CHUNK_SIZE):
+                  part = link_texts[i:i + CHUNK_SIZE]
+                  chunks.append(base + "".join(part) if i == 0 else "".join(part))
+              if len(chunks) < 2:
+                  return None
+              prefix, k0 = pick_helper_base(t)
+              names = [prefix + str(k0 + i) for i in range(len(chunks) - 1)]
+              helpers = []
+              for i, name in enumerate(names):
+                  content = chunks[0] if i == 0 else (names[i - 1] + chunks[i])
+                  helpers.append(
+                      "    private var " + name + ": some View {\n"
+                      "        " + content.strip() + "\n"
+                      "    }"
+                  )
+              new_inner = (
+                  "\n        " + names[-1]
+                  + "".join("\n        " + lt.strip() for lt in
+                            link_texts[(len(chunks) - 1) * CHUNK_SIZE:])
+                  + "\n    "
+              )
+              new_t = t[:open_idx + 1] + new_inner + t[close_idx:]
+              insert_at = open_idx + 1 + len(new_inner) + 1  # 原 close_idx 处 '}' 之后
+              helpers_text = "\n\n" + "\n\n".join(helpers) + "\n"
+              new_t = new_t[:insert_at] + helpers_text + new_t[insert_at:]
+              if not balanced(new_t):
+                  return None
+              return new_t
+
+
+          def process_file(path):
+              with open(path, encoding="utf-8") as f:
+                  orig = f.read()
+              t = orig
+              if HELPER_PREFIX in t:
+                  return False
+              bodies = []
+              for m in re.finditer(r"\bvar\s+body\s*:\s*some\s+View\s*\{", t):
+                  open_idx = m.end() - 1
+                  close_idx = skip_balanced(t, open_idx, "{", "}")
+                  if close_idx is None:
+                      continue
+                  bodies.append((open_idx, close_idx - 1))
+              changed = False
+              for open_idx, close_idx in sorted(bodies, reverse=True):
+                  if t[open_idx:close_idx].count("\n") < MIN_BODY_LINES:
+                      continue
+                  inner_start, inner_end = open_idx + 1, close_idx
+                  if has_top_level_control_flow(t, inner_start, inner_end):
+                      continue
+                  links = find_chain_links(t, inner_start, inner_end)
+                  if not links or len(links) < MIN_LINKS:
+                      continue
+                  new_t = split_body(t, open_idx, close_idx, links)
+                  if new_t is None or new_t == t:
+                      continue
+                  line_no = t[:open_idx].count("\n") + 1
+                  print("  split body at line %d: %d links -> %d helpers"
+                        % (line_no, len(links), (len(links) + CHUNK_SIZE - 1) // CHUNK_SIZE - 1))
+                  t = new_t
+                  changed = True
+              if changed:
+                  with open(path, "w", encoding="utf-8") as f:
+                      f.write(t)
+              return changed
+
+
+          def main(root):
+              total = 0
+              for dirpath, _dirs, files in os.walk(root):
+                  for fn in files:
+                      if not fn.endswith(".swift"):
+                          continue
+                      path = os.path.join(dirpath, fn)
+                      try:
+                          if process_file(path):
+                              print("patched: %s" % os.path.relpath(path, root))
+                              total += 1
+                      except Exception as e:
+                          print("skip %s: %s" % (path, e))
+              print("done, %d file(s) split" % total)
+
+
+          if __name__ == "__main__":
+              main(sys.argv[1] if len(sys.argv) > 1 else ".")
+          PYEOF
+          python3 "$RUNNER_TEMP/auto_split.py" "apps/ios/Orange Cloud"
+
+      - name: Xcode 版本
+        run: xcodebuild -version
+
+      - name: 解析 SPM 依赖(sentry-cocoa)
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/spm-cache"
+
+      - name: 编译(关闭签名 + OPENSOURCE_UNLOCKED)
+        env:
+          CONFIG: Release
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIG" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/build" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/spm-cache" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            "SWIFT_ACTIVE_COMPILATION_CONDITIONS=\$(inherited) OPENSOURCE_UNLOCKED" \
+            build 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: 输出编译错误摘要(失败时)
+        if: failure()
+        run: |
+          LOG="$RUNNER_TEMP/xcodebuild.log"
+          echo "================= 编译错误摘要 ================="
+          if [ -f "$LOG" ]; then
+            grep -a -B3 -A12 -E "(^| )error:" "$LOG" | head -150 || true
+            echo "----------------- 失败的构建命令 -----------------"
+            grep -a -A30 "The following build commands failed" "$LOG" | head -40 || true
+          else
+            echo "未找到编译日志文件"
+          fi
+
+      - name: 上传完整编译日志(失败时)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 打包 IPA
+        env:
+          CONFIG: Release
+        run: |
+          APP_PATH="$RUNNER_TEMP/build/Build/Products/${CONFIG}-iphoneos/Orange Cloud.app"
+          test -d "$APP_PATH" || { echo "未找到 .app: $APP_PATH"; exit 1; }
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP_PATH" Payload/
+          IPA_NAME="OrangeCloud-OPENSOURCE_UNLOCKED-${CONFIG}.ipa"
+          zip -r -y "$IPA_NAME" Payload
+          echo "IPA_NAME=$IPA_NAME" >> "$GITHUB_ENV"
+          ls -lh "$IPA_NAME"
+
+      - name: 上传 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IPA_NAME }}
+          path: ${{ env.IPA_NAME }}
+          if-no-files-found: error
+
+      - name: 发布到 Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFIG: Release
+        run: |
+          set -e
+          # 用北京时间命名 tag,保证唯一
+          TAG="daily-$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
+          echo "Release tag: $TAG"
+          # 若 tag 已存在(重跑),先删掉旧的
+          gh release delete "$TAG" -y 2>/dev/null || true
+          git push origin ":refs/tags/$TAG" 2>/dev/null || true
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          gh release create "$TAG" "${{ env.IPA_NAME }}" \
+            --title "OrangeCloud 解锁版 $TAG" \
+            --notes "## OrangeCloud iOS 解锁版(自动构建)
+
+          - 同步上游: https://github.com/chen2he/orange-cloud @ ${SHORT_SHA}
+          - 编译配置: ${CONFIG}
+          - 已注入 \`OPENSOURCE_UNLOCKED\`,解锁全部功能(跳过 StoreKit 内购校验)
+          - 未签名 IPA,需自行签名后安装(Sideloadly / AltStore / TrollStore)
+          - Bundle ID 与官方版相同(\`jiamin.chen.orange-cloud\`),安装前请先卸载 App Store 官方版"
+          echo "已发布到 Releases: $TAG"
